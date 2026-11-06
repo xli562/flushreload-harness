@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """Measure Flush+Reload key-recovery accuracy under varying VCPU load.
 
+Local variant of run_experiments.py: runs directly on this machine via
+`bash -s` instead of shelling out through ssh.exe/WSL to a separate VM.
+Same experiment logic, CSV schema, and CLI as the original -- only the
+execution plumbing (run_bash vs. ssh_bash) and the binary locations
+differ.
+
 exp1: fixed threshold T0 (calibrated once at zero load) at every level.
 exp2: threshold recalibrated at each load level.
 
-Each (level, rep) point runs on the VM in one SSH session so the load
-generator survives across calibration and newspy. Loader is killed on
-script exit, after newspy finishes.
+Requires at least two vCPUs/cores: the loader is pinned to CPU 0 and
+calibration/newspy are pinned to CPU 1 (see LOADER_CPU/SPY_CPU below).
+
+Compatible with Python 3.8.5 (the `from __future__ import annotations`
+import below defers evaluation of type hints, so the lowercase generic
+annotations like `list[int]` don't need Python 3.9's native support).
 """
+from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import subprocess
 import sys
@@ -18,12 +29,10 @@ from datetime import datetime
 from pathlib import Path
 from statistics import mean, pstdev
 
-SSH = "/mnt/c/Windows/System32/OpenSSH/ssh.exe"
-HOST = "flrl"
-VM_HOME = "~/Flush-Reload"
-LOADER = f"{VM_HOME}/loadgen"
-NEWSPY = f"{VM_HOME}/newspy"
-CALIB = f"{VM_HOME}/calibration"
+# Directory containing the built loadgen/newspy/calibration binaries.
+# Override with the FLUSHRELOAD_BIN_DIR env var or --bin-dir if they
+# live somewhere other than ~/Flush-Reload.
+BIN_DIR = Path(os.environ.get("FLUSHRELOAD_BIN_DIR", str(Path.home() / "Flush-Reload"))).expanduser()
 
 DEFAULT_LEVELS = list(range(0, 100, 10))
 DEFAULT_REPS = 3
@@ -45,24 +54,24 @@ RE_ACTUAL = re.compile(r"^Actual key:[ \t]+([0-9a-f ]+)$", re.M)
 RE_RECOV = re.compile(r"^Recovered key:[ \t]+([0-9a-f ]+)$", re.M)
 
 
-def ssh_bash(script: str, timeout_s: int) -> str:
-    """Run a bash script on the VM via ssh.exe; return stdout.
+def run_bash(script: str, timeout_s: int) -> str:
+    """Run a bash script locally; return stdout.
 
-    :param script: Bash text passed to `bash -s` on the remote host.
+    :param script: Bash text passed to `bash -s` on this machine.
     :param timeout_s: Hard subprocess timeout.
-    :return: Remote stdout as text.
-    :raises RuntimeError: on ssh error, timeout, or non-zero remote rc.
+    :return: stdout as text.
+    :raises RuntimeError: on a non-zero exit or timeout.
     """
     try:
         proc = subprocess.run(
-            [SSH, HOST, "bash -s"],
+            ["bash", "-s"],
             input=script, capture_output=True, text=True, timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"SSH timed out after {timeout_s}s")
+        raise RuntimeError(f"Script timed out after {timeout_s}s")
     if proc.returncode != 0:
         raise RuntimeError(
-            f"Remote script failed (rc={proc.returncode})\n"
+            f"Script failed (rc={proc.returncode})\n"
             f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         )
     return proc.stdout
@@ -107,11 +116,11 @@ def byte_accuracy(actual: bytes, recovered: bytes) -> tuple[float, bool]:
     return matched / len(actual), matched == len(actual)
 
 
-def _calib_emit_block(n_runs: int) -> str:
+def _calib_emit_block(n_runs: int, calib: str) -> str:
     """Emit bash that runs calibration n_runs times and echoes each threshold."""
     return (
         f"for i in $(seq 1 {n_runs}); do\n"
-        f"  V=$(timeout {CALIB_TIMEOUT_S} taskset -c {SPY_CPU} {CALIB} | "
+        f"  V=$(timeout {CALIB_TIMEOUT_S} taskset -c {SPY_CPU} {calib} | "
         "awk -F': ' '/Suggested cache hit/ {print $NF}')\n"
         f'  if [ -z "$V" ]; then echo CALIB_PARSE_ERROR; exit 2; fi\n'
         f'  echo "THRESHOLD $V"\n'
@@ -119,20 +128,24 @@ def _calib_emit_block(n_runs: int) -> str:
     )
 
 
-def build_run_script(level: int, mode: str, exp: int, T0: int) -> str:
-    """Build the remote bash script for one (level, rep) point.
+def build_run_script(level: int, mode: str, exp: int, T0: int,
+                      loader: str, newspy: str, calib: str) -> str:
+    """Build the local bash script for one (level, rep) point.
 
     :param level: Target loader duty cycle (%).
     :param mode: Loader mode: 'mem', 'busy', 'target', or 'evict'.
     :param exp: 1 (use T0) or 2 (recalibrate).
     :param T0: Fixed threshold for exp1; ignored for exp2.
+    :param loader: Path to the loadgen binary.
+    :param newspy: Path to the newspy binary.
+    :param calib: Path to the calibration binary.
     :return: Bash script text.
     """
     if exp == 2:
         thresh_block = (
             f"SUM=0; N=0\n"
             + f"for i in $(seq 1 {CALIB_RUNS}); do\n"
-            + f"  V=$(timeout {CALIB_TIMEOUT_S} taskset -c {SPY_CPU} {CALIB} | "
+            + f"  V=$(timeout {CALIB_TIMEOUT_S} taskset -c {SPY_CPU} {calib} | "
             + "awk -F': ' '/Suggested cache hit/ {print $NF}')\n"
             + '  if [ -z "$V" ]; then echo CALIB_PARSE_ERROR; exit 2; fi\n'
             + '  echo "THRESHOLD $V"\n'
@@ -148,7 +161,7 @@ trap 'pkill -x loadgen 2>/dev/null || true' EXIT INT TERM
 pkill -x loadgen 2>/dev/null || true
 sleep 0.2
 
-taskset -c {LOADER_CPU} {LOADER} {mode} {level} >/dev/null 2>&1 &
+taskset -c {LOADER_CPU} {loader} {mode} {level} >/dev/null 2>&1 &
 LOADER_PID=$!
 sleep {WARMUP_S}
 if ! kill -0 $LOADER_PID 2>/dev/null; then
@@ -172,7 +185,7 @@ echo "LOAD_MEASURED $LOAD"
 {thresh_block}
 echo "THRESH_USED $THRESH"
 
-timeout {NEWSPY_TIMEOUT_S} taskset -c {SPY_CPU} {NEWSPY} -c $THRESH
+timeout {NEWSPY_TIMEOUT_S} taskset -c {SPY_CPU} {newspy} -c $THRESH
 NEWSPY_RC=$?
 if [ $NEWSPY_RC -ne 0 ]; then
   echo "NEWSPY_TIMEOUT_OR_ERROR rc=$NEWSPY_RC" >&2
@@ -181,25 +194,26 @@ fi
 """
 
 
-def calibrate_baseline() -> tuple[int, list[int]]:
+def calibrate_baseline(calib: str) -> tuple[int, list[int]]:
     """Run calibration CALIB_RUNS times with no load. Return (mean, raw)."""
     script = (
         "set -u\n"
         "pkill -x loadgen 2>/dev/null || true\n"
         "sleep 0.2\n"
-        + _calib_emit_block(CALIB_RUNS)
+        + _calib_emit_block(CALIB_RUNS, calib)
     )
-    out = ssh_bash(script, timeout_s=CALIB_TIMEOUT_S * CALIB_RUNS + 60)
+    out = run_bash(script, timeout_s=CALIB_TIMEOUT_S * CALIB_RUNS + 60)
     raw = parse_thresholds(out)
     if len(raw) != CALIB_RUNS:
         raise RuntimeError(f"Expected {CALIB_RUNS} thresholds, got {len(raw)}: {raw}")
     return int(mean(raw) + 0.5), raw
 
 
-def run_point(level: int, rep: int, mode: str, exp: int, T0: int) -> dict:
+def run_point(level: int, rep: int, mode: str, exp: int, T0: int,
+               loader: str, newspy: str, calib: str) -> dict:
     """Execute one (level, rep) data point and return its record."""
-    script = build_run_script(level, mode, exp, T0)
-    out = ssh_bash(
+    script = build_run_script(level, mode, exp, T0, loader, newspy, calib)
+    out = run_bash(
         script,
         timeout_s=CALIB_TIMEOUT_S * CALIB_RUNS + NEWSPY_TIMEOUT_S + 60,
     )
@@ -226,18 +240,19 @@ def run_point(level: int, rep: int, mode: str, exp: int, T0: int) -> dict:
     return rec
 
 
-def run_experiment(exp: int, levels: list[int], reps: int, mode: str) -> list[dict]:
-    """Run one experiment across levels × reps."""
+def run_experiment(exp: int, levels: list[int], reps: int, mode: str,
+                    loader: str, newspy: str, calib: str) -> list[dict]:
+    """Run one experiment across levels x reps."""
     T0 = 0
     if exp == 1:
         print("Calibrating T0 at zero load ...", flush=True)
-        T0, raw = calibrate_baseline()
+        T0, raw = calibrate_baseline(calib)
         print(f"  T0 = {T0}  raw = {raw}")
     records: list[dict] = []
     for level in levels:
         for rep in range(reps):
             print(f"[exp{exp}] level={level:>2}% rep={rep} ... ", end="", flush=True)
-            rec = run_point(level, rep, mode, exp, T0)
+            rec = run_point(level, rep, mode, exp, T0, loader, newspy, calib)
             print(f"load={rec['load_pct']:5.1f}%  acc={rec['accuracy']:.3f}")
             records.append(rec)
     return records
@@ -270,23 +285,37 @@ def main() -> int:
     ap.add_argument("--levels", type=int, nargs="+", default=DEFAULT_LEVELS)
     ap.add_argument("--reps", type=int, default=DEFAULT_REPS)
     ap.add_argument("--mode", choices=["mem", "busy", "target", "evict"], default="mem")
+    ap.add_argument("--bin-dir", default=str(BIN_DIR),
+                    help="Directory containing the loadgen/newspy/calibration binaries "
+                         "(default: $FLUSHRELOAD_BIN_DIR or ~/Flush-Reload)")
     args = ap.parse_args()
+
+    bin_dir = Path(args.bin_dir).expanduser()
+    loader = str(bin_dir / "loadgen")
+    newspy = str(bin_dir / "newspy")
+    calib = str(bin_dir / "calibration")
+    for p in (loader, newspy, calib):
+        if not Path(p).is_file():
+            print(f"error: expected binary not found: {p}", file=sys.stderr)
+            print(f"(build it in {bin_dir}, or pass --bin-dir / set FLUSHRELOAD_BIN_DIR)",
+                  file=sys.stderr)
+            return 1
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.experiment in ("exp1", "both"):
-        recs = run_experiment(1, args.levels, args.reps, args.mode)
-        stamped_path = OUT_DIR / f"{stamp}_exp1.csv"
+        recs = run_experiment(1, args.levels, args.reps, args.mode, loader, newspy, calib)
+        stamped_path = OUT_DIR / f"{stamp}_exp1_{args.mode}.csv"
         write_csv(stamped_path, recs, 1)
-        write_csv(OUT_DIR / "exp1.csv", recs, 1)
-        print(f"Wrote {stamped_path} and {OUT_DIR / 'exp1.csv'}")
+        write_csv(OUT_DIR / f"exp1_{args.mode}.csv", recs, 1)
+        print(f"Wrote {stamped_path} and {OUT_DIR / f'exp1_{args.mode}.csv'}")
 
     if args.experiment in ("exp2", "both"):
-        recs = run_experiment(2, args.levels, args.reps, args.mode)
-        stamped_path = OUT_DIR / f"{stamp}_exp2.csv"
+        recs = run_experiment(2, args.levels, args.reps, args.mode, loader, newspy, calib)
+        stamped_path = OUT_DIR / f"{stamp}_exp2_{args.mode}.csv"
         write_csv(stamped_path, recs, 2)
-        write_csv(OUT_DIR / "exp2.csv", recs, 2)
-        print(f"Wrote {stamped_path} and {OUT_DIR / 'exp2.csv'}")
+        write_csv(OUT_DIR / f"exp2_{args.mode}.csv", recs, 2)
+        print(f"Wrote {stamped_path} and {OUT_DIR / f'exp2_{args.mode}.csv'}")
 
     return 0
 
